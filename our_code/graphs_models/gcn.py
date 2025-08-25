@@ -1,0 +1,367 @@
+from graphs_models.layer_model import *
+
+
+class GCN(AbstractGraph):
+    def __init__(self, config: ModelConfig):
+        super(GCN, self).__init__(**vars(config))
+
+
+        self.pre_conv_linear_gene = nn.Linear(self.num_features, self.raised_dimension)
+        self.pre_conv_linear_mirna = nn.Linear(1, self.raised_dimension)
+    
+        self.conv1 = ChebConv(self.raised_dimension, self.hid, K=5)
+        self.conv2 = ChebConv(self.hid, self.hid, K=5)
+        if self.poolsize <= 1:
+                self.linear_input = (self.num_gene + self.num_mirna) * self.hid
+        else:
+                self.linear_input = math.floor((self.num_gene + self.num_mirna) / self.poolsize) * self.hid
+
+        self.linear1 = nn.Linear(self.linear_input, self.linear_input//4)
+        self.linear2 = nn.Linear(self.linear_input//4, self.concate_layer)
+
+        if self.decoder:
+            if self.num_features == 1:
+                ## Omic mode: Exp, mi, Exp+mi
+                self.decoder_1 = nn.Linear(self.concate_layer, self.concate_layer*2)
+                self.decoder_2 = nn.Linear(self.concate_layer*2, self.num_gene+self.num_mirna)
+            elif self.num_features == 2:
+                ## omic_mode: Exp+CNV, Exp+CNV+mi
+                self.decoder_1 = nn.Linear(self.concate_layer, self.concate_layer*2)
+                self.decoder_2 = nn.Linear(self.concate_layer*2, self.num_gene*self.num_features + self.num_mirna)
+
+
+        if self.parallel:
+
+            parallel_input = self.raised_dimension*(self.num_gene + self.num_mirna)
+
+            self.parallel_linear1 = nn.Linear(parallel_input, parallel_input//4)
+            self.parallel_linear2 = nn.Linear(parallel_input//4, self.concate_layer)
+            self.classifier = nn.Linear(self.concate_layer*2, self.num_classes)
+        else:
+            self.classifier = nn.Linear(self.concate_layer, self.num_classes)
+
+    # Max pooling of size p. Must be a power of 2.
+    def graph_max_pool(self, x, p):
+        if p > 1:
+            x = x.permute(0,2,1).contiguous()  # x = B x F x V
+            x = nn.MaxPool1d(p)(x)             # B x F x V/p
+            x = x.permute(0,2,1).contiguous()  # x = B x V/p x F
+        return x
+    
+    ## create the batch index for each nodes in the batch
+    def create_batch_index(self, batches):
+        batch_index = []
+        for i in range(batches):
+            batch_index += [i]*(self.num_gene + self.num_mirna)
+        return(torch.Tensor(batch_index).type(torch.int64))
+        
+    def forward(self, x, edge_index, edge_weight):
+        batches = x.shape[0]
+        num_node = x.shape[1]
+        
+        if self.num_mirna == 0 or self.num_features == 1:
+            x = self.pre_conv_linear_gene(x)
+            x = F.relu(x)
+        else:
+            ## the second matrix cnv_data has padding
+            x_exp_mirna = x[:,:,0]
+            x_cnv = x[:,:,1]
+
+            ## separate mirna from the rest
+            x_cnv = x_cnv[:,:-100]
+            x_exp = x_exp_mirna[:,:-100]
+
+            x_cnv = x_cnv.view(batches,-1,1)
+            x_exp = x_exp.view(batches,-1,1)
+            x_gene = torch.cat([x_exp,x_cnv],dim=1)
+            x_gene = x_gene.view(-1,self.num_features)
+            x_mirna = x_exp_mirna[:,-100:]
+            x_mirna = torch.flatten(x_mirna)
+            x_mirna = x_mirna.view(-1, 1)
+
+            x_gene = self.pre_conv_linear_gene(x_gene)
+            x_gene = F.relu(x_gene)
+
+            x_mirna = self.pre_conv_linear_mirna(x_mirna)
+            x_mirna = F.relu(x_mirna)
+
+            x_gene = x_gene.view(batches, -1, self.raised_dimension)
+            x_mirna = x_mirna.view(batches, -1, self.raised_dimension)
+
+            x = torch.cat([x_gene,x_mirna],dim=1)
+
+
+
+        x_parallel = x
+        x = x.view(-1, self.raised_dimension)
+        x_parallel = x_parallel.view(batches,-1)
+
+        if self.edge_weights:
+            x = self.conv1(x, edge_index, edge_weight)
+
+            x = F.relu(x)
+        else:
+            x = self.conv1(x, edge_index)
+
+            x = F.relu(x)
+
+        if self.edge_weights:
+            x = self.conv2(x, edge_index, edge_weight)
+
+            x = F.relu(x)
+        else:
+            x = self.conv2(x, edge_index) ## output shape: [batches * num_node, hid * head]
+
+            x = F.relu(x)
+
+        ## pooling on the graph to reduce nodes
+        x = x.view(batches, num_node, -1) ## output shape: [batches, num_node, hid * head]
+        x = self.graph_max_pool(x, self.poolsize)   ## if "gat", then output shape: [batches, floor(num_node / poolsize), hid * head]
+                                                    ## if "gcn", then output shape: [batches, floor(num_node / poolsize), hid]
+
+        if self.method == 'gcn':
+            x = x.view(-1, self.hid) ## output shape:[batches * floor(num_node / poolsize), hid]
+
+        x = x.view(batches, -1) ## output size: [batches, floor(num_node / poolsize) * hid * head]
+        x = self.linear1(x)
+        x = F.relu(x)
+        x = self.linear2(x)
+        x = F.relu(x)
+
+        if self.decoder:
+            x_reconstruct = x
+            x_reconstruct = self.decoder_1(x_reconstruct)
+            x_reconstruct = F.relu(x_reconstruct)
+
+            x_reconstruct  = nn.Dropout(0.2)(x_reconstruct)
+            x_reconstruct = self.decoder_2(x_reconstruct)
+
+        if self.parallel:
+            ## the two layer shallow FC network
+            x_parallel = self.parallel_linear1(x_parallel)
+            x_parallel = F.relu(x_parallel)
+            x_parallel = self.parallel_linear2(x_parallel)
+            x_parallel = F.relu(x_parallel)
+
+            x = torch.cat((x,x_parallel),1)
+        x = F.dropout(x, p=self.dropout_rate, training=self.training)
+        x = self.classifier(x)
+
+        if self.decoder:
+            return x_reconstruct, F.log_softmax(x, dim=1)
+        else:
+            return F.log_softmax(x, dim=1)
+    
+    def loss(self, x_reconstruct, x_target, y, y_target, l2_regularization):
+        if self.decoder:
+            if self.num_mirna == 0 or self.num_features == 1:
+                x_target = x_target.view(x_target.size()[0], -1)
+                loss1 = nn.MSELoss()(x_reconstruct, x_target)
+            else:
+                x_target_exp_mirna = x_target[:,:,0]
+                x_target_cnv = x_target[:,:,1]
+
+                ## separate mirna from the rest
+                x_target_cnv = x_target_cnv[:,:-100]
+                x_target_exp = x_target_exp_mirna[:,:-100]
+                x_target_mirna = x_target_exp_mirna[:,-100:]
+                x_target_flatten = torch.cat([x_target_exp, x_target_cnv, x_target_mirna], dim=1)
+                loss1 = nn.MSELoss()(x_reconstruct, x_target_flatten)
+        else:
+            loss1 = 0
+        
+        loss2 = nn.CrossEntropyLoss()(y, y_target)
+        loss = 1*loss1 + 1*loss2
+        
+        if self.l2:
+            l2_loss = 0.0
+            for param in self.parameters():
+                data = param* param
+                l2_loss += data.sum()
+
+            loss += 0.2* l2_regularization* l2_loss
+        return loss
+
+
+# class GCN(AbstractGraph):
+#     def __init__(self, config: ModelConfig):
+#         super(GCN, self).__init__(**vars(config))
+
+#         self.pre_conv_linear_gene = nn.Linear(self.num_features, self.raised_dimension)
+#         self.pre_conv_linear_mirna = nn.Linear(1, self.raised_dimension)
+    
+#         self.conv1 = ChebConv(self.raised_dimension, self.hid, K=5)
+#         self.conv2 = ChebConv(self.hid, self.hid, K=5)
+#         if self.poolsize <= 1:
+#                 self.linear_input = (self.num_gene + self.num_mirna) * self.hid
+#         else:
+#                 self.linear_input = math.floor((self.num_gene + self.num_mirna) / self.poolsize) * self.hid
+
+#         self.linear1 = nn.Linear(self.linear_input, self.linear_input//4)
+#         self.linear2 = nn.Linear(self.linear_input//4, self.concate_layer)
+
+#         if self.decoder:
+#             if self.num_features == 1:
+#                 ## Omic mode: Exp, mi, Exp+mi
+#                 self.decoder_1 = nn.Linear(self.concate_layer, self.concate_layer*2)
+#                 self.decoder_2 = nn.Linear(self.concate_layer*2, self.num_gene+self.num_mirna)
+#             elif self.num_features == 2:
+#                 ## omic_mode: Exp+CNV, Exp+CNV+mi
+#                 self.decoder_1 = nn.Linear(self.concate_layer, self.concate_layer*2)
+#                 self.decoder_2 = nn.Linear(self.concate_layer*2, self.num_gene*self.num_features + self.num_mirna)
+
+
+#         if self.parallel:
+
+#             parallel_input = self.raised_dimension*(self.num_gene + self.num_mirna)
+
+#             self.parallel_linear1 = nn.Linear(parallel_input, parallel_input//4)
+#             self.parallel_linear2 = nn.Linear(parallel_input//4, self.concate_layer)
+#             self.classifier = nn.Linear(self.concate_layer*2, self.num_classes)
+#         else:
+#             self.classifier = nn.Linear(self.concate_layer, self.num_classes)
+
+#     # Max pooling of size p. Must be a power of 2.
+#     def graph_max_pool(self, x, p):
+#         if p > 1:
+#             x = x.permute(0,2,1).contiguous()  # x = B x F x V
+#             x = nn.MaxPool1d(p)(x)             # B x F x V/p
+#             x = x.permute(0,2,1).contiguous()  # x = B x V/p x F
+#         return x
+    
+#     ## create the batch index for each nodes in the batch
+#     def create_batch_index(self, batches):
+#         batch_index = []
+#         for i in range(batches):
+#             batch_index += [i]*(self.num_gene + self.num_mirna)
+#         return(torch.Tensor(batch_index).type(torch.int64))
+        
+#     def forward(self, x, edge_index, edge_weight):
+#         batches = x.shape[0]
+#         num_node = x.shape[1]
+        
+#         if self.num_mirna == 0 or self.num_features == 1:
+#             x = self.pre_conv_linear_gene(x)
+#             x = F.relu(x)
+#         else:
+#             ## the second matrix cnv_data has padding
+#             x_exp_mirna = x[:,:,0]
+#             x_cnv = x[:,:,1]
+
+#             ## separate mirna from the rest
+#             x_cnv = x_cnv[:,:-100]
+#             x_exp = x_exp_mirna[:,:-100]
+
+#             x_cnv = x_cnv.view(batches,-1,1)
+#             x_exp = x_exp.view(batches,-1,1)
+#             x_gene = torch.cat([x_exp,x_cnv],dim=1)
+#             x_gene = x_gene.view(-1,self.num_features)
+#             x_mirna = x_exp_mirna[:,-100:]
+#             x_mirna = torch.flatten(x_mirna)
+#             x_mirna = x_mirna.view(-1, 1)
+
+#             x_gene = self.pre_conv_linear_gene(x_gene)
+#             x_gene = F.relu(x_gene)
+
+#             x_mirna = self.pre_conv_linear_mirna(x_mirna)
+#             x_mirna = F.relu(x_mirna)
+
+#             x_gene = x_gene.view(batches, -1, self.raised_dimension)
+#             x_mirna = x_mirna.view(batches, -1, self.raised_dimension)
+
+#             x = torch.cat([x_gene,x_mirna],dim=1)
+
+
+
+#         x_parallel = x
+#         x = x.view(-1, self.raised_dimension)
+#         x_parallel = x_parallel.view(batches,-1)
+
+#         if self.edge_weights:
+#             x = self.conv1(x, edge_index, edge_weight)
+
+#             x = F.relu(x)
+#         else:
+#             x = self.conv1(x, edge_index)
+
+#             x = F.relu(x)
+
+#         if self.edge_weights:
+#             x = self.conv2(x, edge_index, edge_weight)
+
+#             x = F.relu(x)
+#         else:
+#             x = self.conv2(x, edge_index) ## output shape: [batches * num_node, hid * head]
+
+#             x = F.relu(x)
+
+#         ## pooling on the graph to reduce nodes
+#         x = x.view(batches, num_node, -1) ## output shape: [batches, num_node, hid * head]
+#         x = self.graph_max_pool(x, self.poolsize)   ## if "gat", then output shape: [batches, floor(num_node / poolsize), hid * head]
+#                                                     ## if "gcn", then output shape: [batches, floor(num_node / poolsize), hid]
+
+#         if self.method == 'gcn':
+#             x = x.view(-1, self.hid) ## output shape:[batches * floor(num_node / poolsize), hid]
+
+#         x = x.view(batches, -1) ## output size: [batches, floor(num_node / poolsize) * hid * head]
+#         x = self.linear1(x)
+#         x = F.relu(x)
+#         x = self.linear2(x)
+#         x = F.relu(x)
+
+#         if self.decoder:
+#             x_reconstruct = x
+#             x_reconstruct = self.decoder_1(x_reconstruct)
+#             x_reconstruct = F.relu(x_reconstruct)
+
+#             x_reconstruct  = nn.Dropout(0.2)(x_reconstruct)
+#             x_reconstruct = self.decoder_2(x_reconstruct)
+
+#         if self.parallel:
+#             ## the two layer shallow FC network
+#             x_parallel = self.parallel_linear1(x_parallel)
+#             x_parallel = F.relu(x_parallel)
+#             x_parallel = self.parallel_linear2(x_parallel)
+#             x_parallel = F.relu(x_parallel)
+
+#             x = torch.cat((x,x_parallel),1)
+#         x = F.dropout(x, p=self.dropout_rate, training=self.training)
+#         x = self.classifier(x)
+
+#         if self.decoder:
+#             return x_reconstruct, F.log_softmax(x, dim=1)
+#         else:
+#             return F.log_softmax(x, dim=1)
+    
+#     def loss(self, x_reconstruct, x_target, y, y_target, l2_regularization):
+#         if self.decoder:
+#             if self.num_mirna == 0 or self.num_features == 1:
+#                 x_target = x_target.view(x_target.size()[0], -1)
+#                 loss1 = nn.MSELoss()(x_reconstruct, x_target)
+#             else:
+#                 x_target_exp_mirna = x_target[:,:,0]
+#                 x_target_cnv = x_target[:,:,1]
+
+#                 ## separate mirna from the rest
+#                 x_target_cnv = x_target_cnv[:,:-100]
+#                 x_target_exp = x_target_exp_mirna[:,:-100]
+#                 x_target_mirna = x_target_exp_mirna[:,-100:]
+#                 x_target_flatten = torch.cat([x_target_exp, x_target_cnv, x_target_mirna], dim=1)
+#                 loss1 = nn.MSELoss()(x_reconstruct, x_target_flatten)
+#         else:
+#             loss1 = 0
+        
+#         loss2 = nn.CrossEntropyLoss()(y, y_target)
+#         loss = 1*loss1 + 1*loss2
+        
+#         if self.l2:
+#             l2_loss = 0.0
+#             for param in self.parameters():
+#                 data = param* param
+#                 l2_loss += data.sum()
+
+#             loss += 0.2* l2_regularization* l2_loss
+#         return loss
+
+
+
