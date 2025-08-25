@@ -8,6 +8,7 @@ We also reformatted the code to help adding new models, corrected some errors in
 # Datasets
 
 The dataset are available in the original repository: https://github.com/NabaviLab/Multimodal-GNN-for-Cancer-Subtype-Clasification
+They must be added to the directory `data` in `our_code` directory.
 
 # Graphs
 
