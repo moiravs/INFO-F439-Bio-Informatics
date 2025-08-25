@@ -4,11 +4,8 @@ import numpy as np
 # Number of genes corresponding to each accuracy point
 gene_counts = [300, 500, 700, 1000, 2000, 5000]
 
-
-
 # Data
 methods = ['Proposed w/ GAT', 'Proposed w/ GAT (ours)', 'Proposed w/ GCN', 'Proposed w/ GCN (ours)', 'FC-NN', 'FC-NN (ours)',
-
 'GCN (Original)', 'GCN (Original) (ours)',  'GCN (Modified)',
            'GCN (Modified) (ours)', 'Multi-omics GCN (Original)','Multi-omics GCN (Original) (ours)', 'Multi-omics GCN (Modified)', 'Multi-omics GCN (Modified) (ours)',
            'Multi-omics GAT (Original)', 'Multi-omics GAT (Original) (ours)',  'Multi-omics GAT (Modified)', 'Multi-omics GAT (Modified) (ours)']
@@ -35,26 +32,18 @@ accuracy_data = [
     [76.0, 78.6, 69.5, 63.2, 70.7, 54.4]    # Multi-omics GAT (Modified) (even)
 ]
 
-
-
-
 # Create figure and subplots
 plt.figure(figsize=(14, 10))
 
-# Colors for different methods
-colors = plt.cm.tab10(np.linspace(0, 1, len(methods)))
+# Generate unique colors for each line
+colors = plt.cm.tab20(np.linspace(0, 1, len(accuracy_data)))
 
-# Plot accuracy data
-for i in range(0, len(accuracy_data), 2):
-    method_idx = i // 2
-    color = colors[method_idx]
-    
-    # Odd rows (dotted line)
-    plt.plot(gene_counts, accuracy_data[i], 'o--', color=color, alpha=0.7, linewidth=2, markersize=6, label=f'{methods[method_idx]} (odd)')
-    
-    # Even rows (solid line)
-    plt.plot(gene_counts, accuracy_data[i+1], 'o-', color=color, alpha=0.7, linewidth=2, markersize=6, label=f'{methods[method_idx]} (even)')
-
+# Plot accuracy data with unique colors
+for i, data in enumerate(accuracy_data):
+    if i % 2 == 0:  # Odd rows (dotted line)
+        plt.plot(gene_counts, data, 'o--', color=colors[i], alpha=0.7, linewidth=2, markersize=6, label=methods[i])
+    else:  # Even rows (solid line)
+        plt.plot(gene_counts, data, 'o-', color=colors[i], alpha=0.7, linewidth=2, markersize=6, label=methods[i])
 
 # Customize accuracy plot
 plt.title('Accuracy Comparison', fontsize=16, fontweight='bold')
@@ -62,11 +51,9 @@ plt.ylabel('Accuracy (%)', fontsize=14)
 plt.ylim(0, 100)
 plt.grid(True, alpha=0.3)
 plt.xticks(gene_counts)
-plt.xlabel('my data', fontsize=14, color='red')
-plt.legend(handlelength=5)
+plt.xlabel('Number of genes', fontsize=14, color='red')
 
 # Create a unified legend
-
 plt.legend(
     methods, loc='upper right', bbox_to_anchor=(1.15, 0.5), ncol=1, fontsize=10,
     handlelength=5,      # Length of the legend handles
